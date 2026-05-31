@@ -1,15 +1,31 @@
+from io import BytesIO
+
+import pandas as pd
+import pydeck as pdk
 import streamlit as st
 from PIL import Image
-from io import BytesIO
-import pandas as pd
-import time
 
 from frontend.ui import chip_line, location_tags, progress_text, severity_badge
+
+STATUS_FLOW = ["Reported", "Under Review", "Assigned", "Repair In Progress", "Resolved"]
 
 
 def _init_state():
     if "reports" not in st.session_state:
         st.session_state.reports = []
+    if "citizen_history" not in st.session_state:
+        st.session_state.citizen_history = []
+    st.session_state.setdefault("authority_last_seen_count", 0)
+
+
+def _notify_new_reports(count: int):
+    if count <= 0:
+        return
+    message = f"{count} new pothole report{'s' if count != 1 else ''} uploaded."
+    if hasattr(st, "toast"):
+        st.toast(message, icon="📣")
+    else:
+        st.info(message)
 
 
 def _severity_rank(label: str) -> int:
@@ -17,57 +33,79 @@ def _severity_rank(label: str) -> int:
     return {"green": 0, "yellow": 1, "red": 2}.get(sev, 3)
 
 
+def _sync_citizen_history(report_id: str | None, status: str):
+    if not report_id:
+        return
+    for entry in st.session_state.citizen_history:
+        if entry.get("report_id") == report_id:
+            entry["status"] = status
+            break
+
+
+def _map_color(label: str):
+    sev = (label or "").strip().lower()
+    if sev == "red":
+        return [248, 113, 113, 190]
+    if sev == "yellow":
+        return [250, 204, 21, 180]
+    if sev == "green":
+        return [52, 211, 153, 170]
+    return [148, 163, 184, 140]
+
+
 def run():
     _init_state()
     st.markdown("## Government Authority Dashboard")
-    st.caption("Live pothole feed, emergency hazards, status controls, and city monitoring view.")
 
     if st.session_state.get("user_role") != "authority":
         st.info("Use the authority login screen to access this dashboard.")
         return
 
-    with st.sidebar:
-        st.markdown("### Control Panel")
-        severity_filter = st.selectbox("Severity", ["All", "Green", "Yellow", "Red"], index=0)
-        unresolved_only = st.checkbox("Unresolved only", value=False)
-        sort_mode = st.selectbox("Sort by", ["Newest", "Oldest", "Severity"], index=0)
-        search_text = st.text_input("Search source / location", "")
-        st.markdown("---")
-        st.markdown("**Navigation**")
-        st.write("Live Feed")
-        st.write("Emergency Hazards")
-        st.write("Analytics")
-        st.write("Map Placeholder")
-
-    total = len(st.session_state.reports)
-    severe = sum(1 for r in st.session_state.reports if (r.get("severity") or "").lower() == "red")
-    unresolved = sum(1 for r in st.session_state.reports if r.get("status") != "Resolved")
-    resolved = sum(1 for r in st.session_state.reports if r.get("status") == "Resolved")
-    yellow = sum(1 for r in st.session_state.reports if (r.get("severity") or "").lower() == "yellow")
+    reports = st.session_state.reports
+    new_count = max(0, len(reports) - int(st.session_state.get("authority_last_seen_count", 0)))
+    if new_count:
+        _notify_new_reports(new_count)
+        st.session_state.authority_last_seen_count = len(reports)
+    total = len(reports)
+    critical = sum(1 for r in reports if (r.get("severity") or "").lower() == "red")
+    pending = sum(1 for r in reports if r.get("status") != "Resolved")
+    resolved = sum(1 for r in reports if r.get("status") == "Resolved")
 
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Total Reports", total)
-    m2.metric("Severe (Red)", severe)
-    m3.metric("Moderate (Yellow)", yellow)
-    m4.metric("Resolved", resolved)
+    with m1:
+        st.markdown('<div class="metric-card"><div class="field-label">Total Reports</div>', unsafe_allow_html=True)
+        st.markdown(f"### {total}")
+        st.markdown("</div>", unsafe_allow_html=True)
+    with m2:
+        st.markdown('<div class="metric-card"><div class="field-label">Critical Reports</div>', unsafe_allow_html=True)
+        st.markdown(f"### {critical}")
+        st.markdown("</div>", unsafe_allow_html=True)
+    with m3:
+        st.markdown('<div class="metric-card"><div class="field-label">Pending Repairs</div>', unsafe_allow_html=True)
+        st.markdown(f"### {pending}")
+        st.markdown("</div>", unsafe_allow_html=True)
+    with m4:
+        st.markdown('<div class="metric-card"><div class="field-label">Resolved Repairs</div>', unsafe_allow_html=True)
+        st.markdown(f"### {resolved}")
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    st.write("---")
-
-    reports = st.session_state.reports
+    st.write("")
+    filter_col, status_col, sort_col = st.columns([1.4, 1.4, 1])
+    with filter_col:
+        severity_filter = st.multiselect("Severity filters", ["Green", "Yellow", "Red"], default=["Green", "Yellow", "Red"])
+    with status_col:
+        status_filter = st.multiselect("Status filters", STATUS_FLOW, default=STATUS_FLOW)
+    with sort_col:
+        sort_mode = st.selectbox("Sort by", ["Newest", "Oldest", "Severity"], index=0)
 
     def match(r):
-        if severity_filter != "All" and (r.get("severity") or "") != severity_filter:
+        if severity_filter and (r.get("severity") or "") not in severity_filter:
             return False
-        if unresolved_only and r.get("status") == "Resolved":
+        if status_filter and (r.get("status") or "") not in status_filter:
             return False
-        if search_text:
-            s = search_text.lower()
-            if s not in str(r.get("gps", "")).lower() and s not in str(r.get("source", "")).lower():
-                return False
         return True
 
     filtered = [r for r in reports if match(r)]
-
     if sort_mode == "Newest":
         filtered = sorted(filtered, key=lambda item: item.get("timestamp", ""), reverse=True)
     elif sort_mode == "Oldest":
@@ -76,82 +114,94 @@ def run():
         filtered = sorted(filtered, key=lambda item: _severity_rank(item.get("severity")), reverse=True)
 
     if not filtered:
-        st.info("No reports to show. Citizen submissions will appear here.")
-        st.write("You can also add demo reports by uploading in Citizen portal.")
+        st.info("No reports available yet. Citizen submissions will appear here.")
         return
 
     emergency = [r for r in filtered if (r.get("severity") or "").lower() == "red"]
     if emergency:
-        st.markdown("### Immediate Attention Required")
-        for r in emergency[:3]:
-            st.markdown('<div class="avisens-card">', unsafe_allow_html=True)
-            st.markdown(f"{severity_badge('Red')} **{r.get('source', 'citizen').title()}** - {r.get('timestamp')}", unsafe_allow_html=True)
-            st.write(f"Composite Score: {progress_text(r.get('severity_score'))}")
-            st.write(f"Location: {r.get('gps')}")
-            st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown("### Emergency Dispatch (RED)")
+        em_cols = st.columns(min(3, len(emergency)))
+        for idx, r in enumerate(emergency[:3]):
+            with em_cols[idx]:
+                st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+                st.markdown(severity_badge("Red", "Critical"), unsafe_allow_html=True)
+                st.write(f"**GPS:** {r.get('gps')}")
+                st.write(f"**Time:** {r.get('timestamp')}")
+                st.write(f"**Confidence:** {r.get('confidence'):.2%}" if r.get("confidence") is not None else "**Confidence:** --")
+                st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown("### Live Pothole Reports Feed")
+    st.markdown("### Live Report Feed")
     for idx, r in enumerate(filtered):
-        cols = st.columns([1.05, 2.6, 1.35])
-        with cols[0]:
+        st.markdown('<div class="glass-card" style="margin-bottom:1rem;">', unsafe_allow_html=True)
+        col_img, col_meta, col_status = st.columns([1.1, 2.2, 1.1])
+        with col_img:
             try:
                 im = Image.open(BytesIO(r["image"]))
                 st.image(im, width=180)
             except Exception:
                 st.write("[image]")
-        with cols[1]:
-            st.markdown(f"**Severity:** {severity_badge(r.get('severity'))}", unsafe_allow_html=True)
-            st.write(f"**Composite Score:** {progress_text(r.get('severity_score'))}")
-            st.write(f"**Confidence:** {r.get('confidence'):.2%}" if r.get('confidence') is not None else "**Confidence:** --")
-            st.write(f"**Source:** {r.get('source')}")
-            st.write(f"**Time:** {r.get('timestamp')}")
-            st.write(f"**Status:** {r.get('status')}")
-            if r.get('action_plan'):
-                st.write(f"**Action:** {r.get('action_plan')}")
-            if r.get('location_tags'):
-                st.markdown(chip_line(r.get('location_tags')), unsafe_allow_html=True)
-            else:
-                gps = r.get('gps') or {}
-                st.markdown(chip_line(location_tags(gps.get('lat'), gps.get('lon'), source=r.get('source', 'citizen'))), unsafe_allow_html=True)
             if r.get("overlay") is not None:
-                st.image(r.get("overlay"), caption="Segmented highlight", width=420)
-        with cols[2]:
-            st.markdown('<div class="avisens-card">', unsafe_allow_html=True)
-            st.write(f"**Current Status:** {r.get('status')}")
+                st.image(r.get("overlay"), caption="Segmented preview", width=180)
+        with col_meta:
+            st.markdown(severity_badge(r.get("severity"), r.get("severity_class")), unsafe_allow_html=True)
+            st.write(f"**Composite Score:** {progress_text(r.get('severity_score'))}")
+            st.write(f"**Confidence:** {r.get('confidence'):.2%}" if r.get("confidence") is not None else "**Confidence:** --")
+            st.write(f"**GPS:** {r.get('gps')}")
+            st.write(f"**Timestamp:** {r.get('timestamp')}")
+            st.write(f"**Source:** {r.get('source', 'citizen').title()}")
+            if r.get("action_plan"):
+                st.write(f"**Action:** {r.get('action_plan')}")
+            if r.get("location_tags"):
+                st.markdown(chip_line(r.get("location_tags")), unsafe_allow_html=True)
+            else:
+                gps = r.get("gps") or {}
+                st.markdown(chip_line(location_tags(gps.get("lat"), gps.get("lon"), source=r.get("source", "citizen"))), unsafe_allow_html=True)
+        with col_status:
+            st.markdown(f'<span class="status-pill">{r.get("status")}</span>', unsafe_allow_html=True)
             new_status = st.selectbox(
                 f"Update status {idx}",
-                ['Reported', 'Under Review', 'Repair Assigned', 'Repair In Progress', 'Resolved'],
-                index=['Reported', 'Under Review', 'Repair Assigned', 'Repair In Progress', 'Resolved'].index(r.get('status')) if r.get('status') in ['Reported', 'Under Review', 'Repair Assigned', 'Repair In Progress', 'Resolved'] else 0,
+                STATUS_FLOW,
+                index=STATUS_FLOW.index(r.get("status")) if r.get("status") in STATUS_FLOW else 0,
                 key=f"status_{idx}",
             )
-            if st.button(f"Set status {idx}", key=f"set_status_{idx}"):
-                r['status'] = new_status
+            if st.button("Apply", key=f"apply_{idx}", type="primary"):
+                r["status"] = new_status
+                _sync_citizen_history(r.get("report_id"), new_status)
                 st.success(f"Status updated to {new_status}")
-            if r.get("potholes"):
-                with st.expander("Per pothole scores"):
-                    for p in r.get("potholes", []):
-                        st.write(f"- {p.get('severity')} | {p.get('composite_score')} / 100")
-            st.markdown('</div>', unsafe_allow_html=True)
-        st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    st.write("---")
-    st.subheader("City Road Monitoring Map")
-    st.caption("Map placeholder for future GIS integration.")
-    try:
-        rows = []
-        for r in st.session_state.reports:
-            gps = r.get('gps') or {}
-            lat = gps.get('lat')
-            lon = gps.get('lon')
-            if lat is not None and lon is not None:
-                try:
-                    rows.append({"lat": float(lat), "lon": float(lon)})
-                except Exception:
-                    continue
-        if rows:
-            df = pd.DataFrame(rows)
-            st.map(df)
-        else:
-            st.info("Map placeholder — no GPS-enabled reports yet.")
-    except Exception:
-        st.info("Map placeholder (unable to render coordinates).")
+    st.markdown("### Smart City Map")
+    rows = []
+    for r in reports:
+        gps = r.get("gps") or {}
+        lat = gps.get("lat")
+        lon = gps.get("lon")
+        if lat is None or lon is None:
+            continue
+        try:
+            rows.append(
+                {
+                    "lat": float(lat),
+                    "lon": float(lon),
+                    "severity": r.get("severity"),
+                    "color": _map_color(r.get("severity")),
+                }
+            )
+        except Exception:
+            continue
+
+    if rows:
+        df = pd.DataFrame(rows)
+        layer = pdk.Layer(
+            "ScatterplotLayer",
+            data=df,
+            get_position="[lon, lat]",
+            get_fill_color="color",
+            get_radius=40,
+            pickable=True,
+        )
+        view_state = pdk.ViewState(latitude=df["lat"].mean(), longitude=df["lon"].mean(), zoom=11, pitch=35)
+        deck = pdk.Deck(layers=[layer], initial_view_state=view_state, tooltip={"text": "{severity} severity"})
+        st.pydeck_chart(deck, use_container_width=True)
+    else:
+        st.info("No GPS-enabled reports yet. Map will populate as reports arrive.")

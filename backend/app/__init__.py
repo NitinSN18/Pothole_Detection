@@ -13,39 +13,19 @@ from fastapi.responses import JSONResponse
 import uvicorn
 import traceback
 from typing import Optional
-from io import BytesIO
-import cv2
-import numpy as np
-from PIL import Image
-
 from backend.inference import infer_image_bytes
-from backend.severity_engine import compute_severity_from_mask, score_region_mask
+from backend.severity_engine import compute_severity_from_mask
 
 
-def _safe_contour_to_mask(contour_points, shape):
-    mask = np.zeros(shape[:2], dtype=np.uint8)
-    try:
-        pts = np.asarray(contour_points, dtype=np.int32)
-        if pts.ndim == 2 and pts.shape[1] == 2 and pts.shape[0] >= 3:
-            contour = pts.reshape((-1, 1, 2))
-            cv2.drawContours(mask, [contour], -1, 255, thickness=-1)
-            return mask
-    except Exception:
-        return None
-    return None
-
-
-def _score_each_contour(contours, image_bytes, confidence, image_shape):
-    potholes = []
-    for idx, contour in enumerate(contours):
-        region_mask = _safe_contour_to_mask(contour, image_shape)
-        if region_mask is None or cv2.countNonZero(region_mask) == 0:
-            continue
-        region_score = score_region_mask(region_mask, image_bytes, confidence)
-        region_score["index"] = idx
-        region_score["contour"] = contour
-        potholes.append(region_score)
-    return potholes
+def _build_summary(severity: dict, potholes_detected: int) -> dict:
+    return {
+        "severity": severity.get("severity"),
+        "composite_score": severity.get("composite_score"),
+        "confidence": severity.get("confidence"),
+        "potholes_detected": potholes_detected,
+        "water_detected": severity.get("water_detected"),
+        "action_plan": severity.get("action_plan"),
+    }
 
 app = FastAPI(title="AVISENS API")
 
@@ -75,14 +55,13 @@ async def predict(image: UploadFile = File(...)):
         confidence = float(infer_res.get("confidence", 0.0))
 
         severity = compute_severity_from_mask(mask_b64, confidence, content)
-        contours = infer_res.get("contours", []) if isinstance(infer_res.get("contours", []), list) else []
-        potholes = _score_each_contour(contours, content, confidence, np.array(Image.open(BytesIO(content)).convert("RGB")).shape)
+        potholes = severity.get("potholes", []) if isinstance(severity.get("potholes", []), list) else []
         if potholes:
             potholes = sorted(potholes, key=lambda item: item.get("composite_score", 0.0), reverse=True)
             severity = {**severity, "potholes": potholes}
 
         # Compatibility response: include pothole count and concise results array
-        pothole_count = len(potholes) if potholes else (len(contours) if isinstance(contours, list) else 0)
+        pothole_count = int(severity.get("potholes_detected", len(potholes)))
         severity_label = severity.get("severity_label") if isinstance(severity, dict) else None
         composite_score = severity.get("composite_score") if isinstance(severity, dict) else None
         action_plan = severity.get("action_plan") if isinstance(severity, dict) else None
@@ -117,6 +96,7 @@ async def predict(image: UploadFile = File(...)):
             "inference": infer_res,
             "severity": severity,
             "potholes_detected": pothole_count,
+            "summary": _build_summary(severity, pothole_count),
             "results": compact_results,
         }
         return JSONResponse(content=result)
@@ -142,8 +122,7 @@ async def citizen_upload(
         confidence = float(infer_res.get("confidence", 0.0))
 
         severity = compute_severity_from_mask(mask_b64, confidence, content)
-        contours = infer_res.get("contours", []) if isinstance(infer_res.get("contours", []), list) else []
-        potholes = _score_each_contour(contours, content, confidence, np.array(Image.open(BytesIO(content)).convert("RGB")).shape)
+        potholes = severity.get("potholes", []) if isinstance(severity.get("potholes", []), list) else []
         if potholes:
             potholes = sorted(potholes, key=lambda item: item.get("composite_score", 0.0), reverse=True)
             severity = {**severity, "potholes": potholes}
@@ -154,7 +133,8 @@ async def citizen_upload(
             "source": source,
             "inference": infer_res,
             "severity": severity,
-            "potholes_detected": len(potholes) if potholes else (len(contours) if isinstance(contours, list) else 0),
+            "potholes_detected": int(severity.get("potholes_detected", len(potholes))),
+            "summary": _build_summary(severity, int(severity.get("potholes_detected", len(potholes)))),
             "results": [
                 {
                     "index": item.get("index"),
